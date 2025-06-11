@@ -11,7 +11,7 @@ This repository contains a single-cell RNA sequencing (scRNA-seq) analysis pipel
 > *Journal of Allergy and Clinical Immunology.* 2021;148(2):474–488.e11.  
 > [https://doi.org/10.1016/j.jaci.2021.07.025](https://doi.org/10.1016/j.jaci.2021.07.025)
 
-The dataset focuses on **innate lymphoid cells (ILCs)** in lesional and non-lesional skin from patients with **atopic dermatitis**, revealing lineage infidelity and immune dysregulation.
+The dataset focuses on innate lymphoid cells (ILCs) in normal healthy skin and skin from patients with atopic dermatitis.
 
 ## 🧰 Tools Used
 
@@ -24,7 +24,7 @@ This analysis uses the following R-based tools:
 
 ## 🔗 Data Access
 
-**Note:** This project presents a reanalysis of publicly available scRNA-seq data. **Raw data files are not included** in this repository.  
-The dataset can be accessed via its **GEO accession number**, which is provided in the relevant analysis script.
+**Note:** This project presents a reanalysis of publicly available scRNA-seq data. Raw data files are not included in this repository.  
+The dataset can be accessed via its GEO accession number, which is provided in the relevant analysis script.
 
 ---
