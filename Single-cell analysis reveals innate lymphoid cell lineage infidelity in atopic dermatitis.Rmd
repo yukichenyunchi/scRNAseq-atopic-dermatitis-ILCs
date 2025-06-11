@@ -1,0 +1,1157 @@
+---
+title: "Single-cell analysis reveals innate lymphoid cell lineage infidelity in atopic
+  dermatitis"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Yun-Chi (Yuki) Chen
+
+Affiliation: Graduate Institute of
+Biomedical Electronics and Bioinformatics, National Taiwan University
+
+This notebook is for the final project of 113-2 scRNA-seq analysis class. This project aims to analyze the data from this [paper](10.1016/j.jaci.2021.07.025) using Seurat and other packages.
+
+
+# Read data and creat Seurat object
+```{r}
+library(Seurat)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+set.seed(124)
+
+# Create an empty list to store Seurat objects for each sample
+seurat_list <- list()
+
+# List of sample identifiers 
+samples <- c("GSM5474333_NHS1", "GSM5474334_NHS2", "GSM5474335_NHS3", "GSM5474336_AD2", "GSM5474337_AD3", "GSM5474338_AD4", "GSM5474339_AD5")
+
+# Directory containing the raw files
+raw_data_dir <- "/Users/yunchichen/113-2_scRNA/final_project/GSE180885_RAW/"
+```
+
+```{r}
+# Loop through each sample and create a Seurat object
+for (sample in samples) {
+  # Construct the directory path where the 10X data is stored
+  data_dir <- paste0(raw_data_dir, sample)
+  
+  # Read 10X data using the directory path
+  data <- Read10X(data.dir = data_dir) # The Read10X can only read the barcodes.tsv, features.tsv, and matrix.mtx (.gz files are ok) without any prefix
+  
+  # Create Seurat object
+  seurat_obj <- CreateSeuratObject(counts = data)
+  seurat_list[[sample]] <- seurat_obj
+}
+```
+
+
+# Quality control
+
+## Arrange the meta.data columns for easier QC
+```{r}
+# Merge each samples for easier QC
+seurat_merged <- merge(seurat_list[[1]], y = seurat_list[c("GSM5474334_NHS2", "GSM5474335_NHS3", "GSM5474336_AD2", "GSM5474337_AD3", "GSM5474338_AD4", "GSM5474339_AD5")], add.cell.ids = names(seurat_list))
+
+# Create Sample column that is identical as row name (sample_condition and num_barcode)
+seurat_merged$Sample <- rownames(seurat_merged@meta.data)
+
+# Separate the 'Sample' column into 'Sample_ID', 'Sample', and 'Barcode'
+seurat_merged@meta.data <- separate(seurat_merged@meta.data, col = 'Sample', 
+                                    into = c('Sample_ID', 'Sample', 'Barcode'), 
+                                    sep = '_')
+
+# Keep only the alphabetic part of the 'Sample' column and assign to 'Condition' column (e.g., remove the 1 of NHS1)
+seurat_merged@meta.data$Condition <- gsub("\\d", "", seurat_merged@meta.data$Sample)
+
+# Reorder the 'Sample' factor levels to display NHS samples first, followed by AD samples
+seurat_merged$Sample <- factor(seurat_merged$Sample, levels = c("NHS1", "NHS2", "NHS3", "AD2", "AD3", "AD4", "AD5"))
+```
+
+## Calculate and visualize QC metrics
+```{r}
+# Calculate mitochondrial percentage
+seurat_merged$percent.mt <- PercentageFeatureSet(seurat_merged, pattern = "^MT-")
+
+# Visualize QC metrics as a violin plot
+VlnPlot(seurat_merged, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, group.by = 'Sample', pt.size = 0)
+```
+```{r}
+# Create scatter plots for QC results
+plot1 <- FeatureScatter(seurat_merged, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(seurat_merged, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + geom_smooth(method = 'lm')
+plot1
+plot2
+```
+
+## Filter out the low-quality cells
+There are 26278 cells in seurat_merged. After filtering, there are 18208 cells in seurat_filtered. These thresholds (nFeature_RNA < 5000 & percent.mt < 10) are from the original paper, which are also reasonable from our QC visualization.
+```{r}
+seurat_filtered <- subset(seurat_merged, subset = nFeature_RNA < 5000 & percent.mt < 10) 
+```
+
+## Pre-process standard workflow for each sample, in order to input to DoubletFinder
+```{r}
+seurat_list_filtered <- SplitObject(seurat_filtered, split.by = 'Sample')
+
+for (i in 1:length(seurat_list_filtered)) {
+  
+  # Normalize, find variable features, scale, run PCA
+  seurat_list_filtered[[i]] <- seurat_list_filtered[[i]] %>%
+    NormalizeData() %>%  
+    FindVariableFeatures() %>%  
+    ScaleData() %>%  
+    RunPCA(npcs = 20)  
+  
+  # Visualize the elbow plot for each Seurat object to identify the number of PCs to use
+  p1 <- ElbowPlot(seurat_list_filtered[[i]]) + ggtitle(paste("Elbow Plot for", names(seurat_list_filtered)[i])) +
+                                               theme(plot.title = element_text(hjust = 0.5)) # center the title
+  print(p1)
+  
+  # Find neighbors using the first 20 PCs
+  seurat_list_filtered[[i]] <- FindNeighbors(seurat_list_filtered[[i]], dims = 1:20)
+  
+  # Perform clustering (find clusters based on the neighbors)
+  seurat_list_filtered[[i]] <- FindClusters(seurat_list_filtered[[i]], resolution = 0.5)  
+  
+  # Run UMAP using the first 20 principal components from PCA
+  seurat_list_filtered[[i]] <- RunUMAP(seurat_list_filtered[[i]], dims = 1:20)  
+  
+  # Visualize UMAP
+  p2 <- DimPlot(seurat_list_filtered[[i]], reduction = "umap") + ggtitle(paste("UMAP for", names(seurat_list_filtered)[i])) +
+                                                                 theme(plot.title = element_text(hjust = 0.5)) # center the title
+  print(p2)
+  
+  # Define the RDS filename with the directory path
+  rds_filename <- paste0("/Users/yunchichen/113-2_scRNA/final_project/processed_data/", "filtered_", names(seurat_list_filtered)[i], ".rds")
+  
+  # Save the Seurat object to the RDS file
+  saveRDS(seurat_list_filtered[[i]], file = rds_filename)
+}
+
+```
+
+# Remove doublets by DoubletFinder
+
+```{r}
+# Install Doublet Finder
+remotes::install_github('chris-mcginnis-ucsf/DoubletFinder', force = TRUE)
+```
+
+```{r}
+# Library the packages needed for doublet finder
+library(Matrix)
+library(fields)
+library(KernSmooth)
+library(ROCR)
+library(parallel)
+library(DoubletFinder)
+library(Seurat)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+```
+
+```{r}
+# Read the filtered RDS files-----------------------------
+# List all RDS files that start with 'filtered_' in the specified directory
+rds_files <- list.files("/Users/yunchichen/113-2_scRNA/final_project/processed_data/", 
+                        pattern = "^filtered_.*\\.rds$", 
+                        full.names = TRUE)
+
+# Initialize an empty list to store the Seurat objects
+seurat_list_filtered <- list()
+
+# Loop over each RDS file and read it into the list
+for (file in rds_files) {
+  # Read the Seurat object from the RDS file
+  seurat_obj <- readRDS(file)
+  
+  # Extract the sample name from the filename (for naming)
+  sample_name <- gsub("^filtered_", "", gsub(".rds", "", basename(file)))  # Remove "filtered_" and ".rds"
+  
+  # Add the Seurat object to the list with sample_name as key
+  seurat_list_filtered[[sample_name]] <- seurat_obj
+}
+
+# print sample names to check if all the objects are loaded properly by inspecting the list
+print(names(seurat_list_filtered))  
+
+
+# Loop each sample to run Doublet Finder workflow-----------------------------
+for (i in 1:length(seurat_list_filtered)){
+  
+  # pK Identification (no ground-truth)-----------------------------
+  seurat.list.df <- paramSweep(seurat_list_filtered[[i]], PCs = 1:20, sct = FALSE)
+  seurat.df <- summarizeSweep(seurat.list.df, GT = FALSE)
+  seurat.pktable <- find.pK(seurat.df)
+  
+  # Visualize pK identification with ggplot
+  p3 <- ggplot(seurat.pktable, aes(pK, BCmetric, group = 1)) +
+    geom_point() +
+    geom_line() + 
+    ggtitle(paste("pK Identification for", names(seurat_list_filtered)[i])) +  
+    theme(plot.title = element_text(hjust = 0.5),  
+          axis.text = element_text(size = 12),  
+          axis.title = element_text(size = 14)) +  
+    labs(x = "pK Value", y = "BCmetric")  
+  print(p3)
+  
+  # Extract the best pK value
+  pK <- seurat.pktable %>%
+    filter(BCmetric == max(BCmetric)) %>%
+    select(pK)
+  pK <- as.numeric(as.character(pK[[1]]))
+  
+  # Homotypic Doublet Proportion Estimate-----------------------------
+  # Get the number of cells for the current dataset
+  num_cells <- nrow(seurat_list_filtered[[i]]@meta.data)
+  # Tailor the doublet formation rate based on the number of cells
+  doublet_rate <- ifelse(num_cells <= 1000, 0.008,
+                           ifelse(num_cells <= 2000, 0.016,
+                                  ifelse(num_cells <= 3000, 0.023,
+                                         ifelse(num_cells <= 4000, 0.031, 0.039))))
+  # Model homotypic doublets
+  annotations <- seurat_list_filtered[[i]]@meta.data$seurat_clusters
+  homotypic.pro <- modelHomotypic(annotations)           
+  nExp_poi <- round(doublet_rate * num_cells)  
+  nExp_poi.adj <- round(nExp_poi*(1-homotypic.pro))
+  
+  # Run Doublet Finder-----------------------------
+  # ISSUE: Error in xtfrm.data.frame(x) : cannot xtfrm data frames, solved by https://github.com/chris-mcginnis-ucsf/DoubletFinder/issues/228
+  seurat_list_filtered[[i]] <- doubletFinder(seurat_list_filtered[[i]], PCs = 1:20, pN = 0.25, pK = pK, nExp = nExp_poi.adj, sct = FALSE)
+
+  # Visualize doublet-----------------------------
+  # Dynamically generate the column name based on pK and nExp_poi.adj
+  df_column_name <- paste0("DF.classifications_0.25_", pK, "_", nExp_poi.adj)
+  p4 <- DimPlot(seurat_list_filtered[[i]], reduction = "umap", group.by = df_column_name) + ggtitle(names(seurat_list_filtered)[i]) +
+                                                                                theme(plot.title = element_text(hjust = 0.5))
+  print(p4)
+  
+  # Subset the singlet cells (cut the doublet cells)-----------------------------
+  # Visualize how many genes and cells before DF processing
+  seurat_list_filtered[[i]]@assays$RNA@layers$counts@Dim
+  
+  # Keep only the singlet by subset()
+  #ISSUE: Error in FetchData():! None of the requested variables were found by using 
+  #`pro_filter <- subset(seurat_list_filtered[[i]], subset = seurat_list_filtered[[i]]@meta.data[[df_column_name]] == "Singlet")`
+  # The solution is modified from https://github.com/chris-mcginnis-ucsf/DoubletFinder/issues/84#issuecomment-645590209
+  pro_filter <- subset(seurat_list_filtered[[i]], 
+                     cells = rownames(seurat_list_filtered[[i]]@meta.data)[
+                       which(seurat_list_filtered[[i]]@meta.data[[df_column_name]] == "Singlet")
+                     ])
+  
+  # Visualize how many genes and cells after DF processing
+  pro_filter@assays$RNA@layers$counts@Dim
+
+  # Define the RDS filename with the directory path
+  rds_filename2 <- paste0("/Users/yunchichen/113-2_scRNA/final_project/processed_data/", "doublet_removed_", names(seurat_list_filtered)[i], ".rds")
+
+  # Save the Seurat object to the RDS file
+  saveRDS(pro_filter, file = rds_filename2)
+}
+```
+
+# Data Integration by Harmony
+```{r}
+# Read the RDS files that have removed doublets
+rds_files <- list.files("/Users/yunchichen/113-2_scRNA/final_project/processed_data/", 
+                        pattern = "^doublet_removed_.*\\.rds$", 
+                        full.names = TRUE)
+
+# Initialize an empty list to store the Seurat objects
+seurat_list_rmd <- list()
+
+# Loop over each RDS file and read it into the list
+for (file in rds_files) {
+  # Read the Seurat object from the RDS file
+  seurat_obj <- readRDS(file)
+  
+  # Extract the sample name from the filename (optional, for naming)
+  sample_name <- gsub("^doublet_removed_", "", gsub(".rds", "", basename(file)))  
+  
+  # Add the Seurat object to the list with sample_name as key
+  seurat_list_rmd[[sample_name]] <- seurat_obj
+}
+
+# print sample names to check if all the objects are loaded properly by inspecting the list
+print(names(seurat_list_rmd))  
+```
+
+## Visualize batch effects before integration
+```{r}
+# Merge Seurat objects from the list, using sample names as the cell identifiers
+seurat_merged_rmd <- merge(seurat_list_rmd[[1]], 
+                            y = seurat_list_rmd[2:length(seurat_list_rmd)], 
+                            add.cell.ids = names(seurat_list_rmd))
+# Order the levels to make NHS showed before AD 
+seurat_merged_rmd$Sample <- factor(seurat_merged_rmd$Sample, levels = c("NHS1", "NHS2", "NHS3", "AD2", "AD3", "AD4", "AD5"))
+
+# Preprocess the merged Seurat object using standard workflow
+seurat_merged_rmd <- seurat_merged_rmd %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(npcs = 20)  # Set the number of PCs based on your analysis needs
+
+# Elbow Plot to visualize the optimal number of PCs
+ElbowPlot(seurat_merged_rmd)
+
+# Find Neighbors
+seurat_merged_rmd <- FindNeighbors(seurat_merged_rmd, dims = 1:20)  # Using the first 20 PCs
+
+# Find Clusters (Resolution can be adjusted)
+seurat_merged_rmd <- FindClusters(seurat_merged_rmd, resolution = 0.5)  # Adjust resolution based on your clustering needs
+
+# Run UMAP for dimensionality reduction
+seurat_merged_rmd <- RunUMAP(seurat_merged_rmd, dims = 1:20)  # You can adjust the number of dimensions if necessary
+
+# Visualize UMAP
+p1 <- DimPlot(seurat_merged_rmd, reduction = "umap", label = TRUE, group.by = "Sample")
+p2 <- DimPlot(seurat_merged_rmd, reduction = "umap", label = TRUE, group.by = "Condition")
+
+p1 + p2
+```
+From the non-integrated results, we observe a batch effect between the NHS and AD conditions. To address this, we need to perform data integration to align cell types across conditions (e.g., NHS ILC with AD ILC). This integration will help us identify more accurate differentially expressed genes (DEGs) by reducing batch effects and focusing on the true biological differences between conditions.
+
+The next step is to decide on the integration method. The [Seurat tutorial](https://satijalab.org/seurat/articles/integration_introduction) suggests using Canonical Correlation Analysis (CCA) for integration. However, more complex scenarios, like ours with varying donors and protocols between NHS and AD, require a more robust approach, as described in [this tutorial](https://github.com/hbctraining/Intro-to-scRNAseq/blob/master/lessons/06_integration.md#complex-integration-tasks). Given these complexities, we will use Harmony for integration, as used in the original paper of this dataset.
+
+There are more discussion on how to integrate different biological samples across conditions like [1](https://github.com/satijalab/seurat/issues/2059), [2](https://github.com/satijalab/seurat/issues/4753), and [3](https://github.com/satijalab/seurat/discussions/5702), but using Harmony seems to be a better solution in our case.
+
+## Use Harmony to perform data integration
+We followed the first scenario in this [harmony tutorial](https://github.com/hbctraining/Intro-to-scRNAseq/blob/master/lessons/06c_integration_harmony.md).
+```{r}
+# install and library harmony
+# install.packages("harmony")
+library(harmony)
+
+# Perform log-normalization and feature selection, as well as SCT normalization on merged object
+seurat_merged_rmd <- seurat_merged_rmd %>%
+    NormalizeData() %>%
+    FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+    ScaleData() %>%
+    SCTransform(vars.to.regress = "percent.mt")
+
+# Calculate PCs using variable features determined by SCTransform (3000 by default)
+seurat_merged_rmd <- RunPCA(seurat_merged_rmd, assay = "SCT", npcs = 50)
+
+# Before running Harmony, make sure that the metadata of our Seurat object contains one (or several) variable(s) describing the factor(s) we want to integrate on (e.g. one variable for patient sample, one variable for condition)
+harmonized_seurat <- RunHarmony(seurat_merged_rmd,
+				group.by.vars = c("Sample", "Condition"),
+				reduction = "pca", assay.use = "SCT", reduction.save = "harmony")
+
+# Do UMAP and clustering using Harmony embedding instead of PCA
+harmonized_seurat <- harmonized_seurat %>%
+  RunUMAP(reduction = "harmony", assay = "SCT", dims = 1:40) %>%
+  FindNeighbors(reduction = "harmony") %>%
+  FindClusters(resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2)) # The result of different resolution is stored in the SCT_snn_res.X.X column of meta.data.
+
+# Visualize UMAP
+p3 <- DimPlot(harmonized_seurat, reduction = "umap", label = TRUE, group.by = "Sample")
+p4 <- DimPlot(harmonized_seurat, reduction = "umap", label = TRUE, group.by = "Condition")
+
+p3 + p4
+
+# Define the RDS filename with the directory path
+rds_filename3 <- paste0("/Users/yunchichen/113-2_scRNA/final_project/processed_data/", "harmony_integrated", ".rds")
+
+# Save the Seurat object to the RDS file
+saveRDS(harmonized_seurat, file = rds_filename3)
+
+```
+
+
+# Cluster identification
+
+To choose the correct Seurat function for identifying markers in different circumstances, refer to [this tutorial](https://github.com/hbctraining/Intro-to-scRNAseq/blob/master/lessons/09_merged_SC_marker_identification.md). In brief, when the goal is to (1) identify markers for each cluster, regardless of the condition, we should use FindConservedMarkers(). Notably, since we used SCTransform() in our Harmony workflow, the default assay will be set to SCT. Therefore, we need to reset the default assay to RNA before using FindConservedMarkers(). (2) To identify DEGs between conditions, we should first use PrepSCTFindMarkers(), followed by FindMarkers() to identify the DEGs in the same cluster of cells across different conditions, as outlined in [this tutorial](https://satijalab.org/seurat/articles/integration_introduction.html#perform-integration-with-sctransform-normalized-datasets). Alternatively, we can use FindMarkers() with RNA layer to to identify DEGs between conditions.
+
+## Annotate by FindConservedMarkers()
+```{r}
+library(dplyr)
+library(purrr)
+library(tibble)
+
+# Read RDS
+harmonized_seurat <- readRDS("/Users/yunchichen/113-2_scRNA/final_project/processed_data/harmony_integrated.rds")
+
+# After running Harmony or performing other normalization steps, use JoinLayers
+harmonized_seurat[["RNA"]] <- JoinLayers(harmonized_seurat[["RNA"]])
+
+# Set the active identity class to SCT_snn_res.0.6, which the number of cluster is 17 (same with the paper)
+Idents(harmonized_seurat) <- harmonized_seurat$SCT_snn_res.0.6
+
+# Set default assay to RNA
+DefaultAssay(harmonized_seurat) <- "RNA"
+
+```
+
+```{r}
+# Visualize UMAP
+p1 <- DimPlot(harmonized_seurat, reduction = "umap", group.by = "Condition", label = TRUE)
+p2 <- DimPlot(harmonized_seurat, reduction = "umap", group.by = "SCT_snn_res.0.6", label = TRUE) # The cluster number is the same (17) to original paper when resolution is 0.6
+p1 + p2
+```
+
+
+```{r}
+# Create function to get conserved markers for any given cluster
+get_conserved <- function(seurat_object, cluster){
+  FindConservedMarkers(seurat_object,
+                       ident.1 = cluster,
+                       grouping.var = "Condition",
+                       only.pos = TRUE) %>%
+    rownames_to_column(var = "gene") %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+               by = c("gene" = "gene_name")) %>%
+    cbind(cluster_id = cluster, .)
+}
+
+# Iterate function across desired clusters
+conserved_markers <- map_dfr(0:16, function(cluster) {
+  get_conserved(harmonized_seurat, cluster = cluster)
+})
+```
+
+
+```{r}
+# Filter the top 5 markers for each cluster 
+log2fc_threshold <- 1    # Minimum log2 fold change
+pct_diff_threshold <- 0.3  # Minimum absolute difference between pct.1 and pct.2
+
+top5 <- conserved_markers %>%
+  group_by(cluster_id) %>%
+  filter(abs(AD_pct.1 - AD_pct.2) > pct_diff_threshold &    # Difference in percentage of cells expressing the gene
+         abs(NHS_pct.1 - NHS_pct.2) > pct_diff_threshold &   # Difference in percentage for NHS condition
+         (abs(AD_avg_log2FC) > log2fc_threshold | abs(NHS_avg_log2FC) > log2fc_threshold) &  # Large fold change
+          NHS_pct.1 > 0.6 &
+          AD_pct.1 > 0.6) %>%
+  slice_head(n = 5) %>%
+  ungroup()
+
+# Check the top 5 markers selected
+View(top5)
+
+# Create a heatmap for the selected markers
+DoHeatmap(harmonized_seurat, features = top5$gene) + NoLegend()
+```
+
+```{r}
+# Filter the top 10 markers for each cluster 
+log2fc_threshold <- 1    # Minimum log2 fold change
+pct_diff_threshold <- 0.3  # Minimum absolute difference between pct.1 and pct.2
+
+top10 <- conserved_markers %>%
+  group_by(cluster_id) %>%
+  filter(abs(AD_pct.1 - AD_pct.2) > pct_diff_threshold &    # Difference in percentage of cells expressing the gene
+         abs(NHS_pct.1 - NHS_pct.2) > pct_diff_threshold &   # Difference in percentage for NHS condition
+         (abs(AD_avg_log2FC) > log2fc_threshold | abs(NHS_avg_log2FC) > log2fc_threshold) &  # Large fold change
+          NHS_pct.1 > 0.6 &
+          AD_pct.1 > 0.6) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+# Check the top 10 markers selected
+View(top10)
+
+# Create a heatmap for the selected markers
+DoHeatmap(harmonized_seurat, features = top10$gene) + NoLegend()
+```
+After inspecting the top5/10 genes, the annotation is as follow:
+
+1: NK
+2: KC
+4: KC
+5: KC
+6: NK
+9: ILCs
+10: FB
+13: B
+16: ILCs
+
+Some cluster markers do not correspond to a single cell type (cluster 0, 3, 7, 8, 11, 12, 14, 15). Moreover, T cells (T), Melanocytes (MEL), Phagocytes (PH), Endothelial cells (EC), and Smooth muscle cells (SMC) are present in the paper’s clusters but absent in ours. 
+
+To resolve these issues, we inspect the markers from the paper as well as the canonical markers in each cluster.
+
+
+## Annotate by the markers from the paper and by the canonical markers
+
+```{r}
+# Plot a dot plot to visualize the marker genes from the paper in each cluster
+
+library(ggplot2)
+
+marker_genes <- c(
+  # ILCs
+  "PTPRC", "KLRB1", "IL7R",
+  # NK cells
+  "KLRD1",
+  # Keratinocytes (KC)
+  "KRT1", "KRT5",
+  # T cells (T)
+  "CD3D",
+  # Fibroblasts (FB)
+  "COL6A1",
+  # B-cell lineage (B)
+  "CD79A", "IGHG1",
+  # Phagocytes (PH)
+  "LYZ",
+  # Endothelial cells (EC)
+  "CLEC14A", "PECAM1",
+  # Smooth muscle cells (SMC)
+  "TAGLN", "ACTA2",
+  # Melanocytes (MEL)
+  "MLANA"
+)
+
+DotPlot(harmonized_seurat, features = marker_genes) + 
+  scale_color_gradient2(low = "blue", mid = "lightgrey", high = "red") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+From the result, the annotation is as follow:
+0: ILCs
+1: NK
+2: KC
+3: ILCs+KC
+4: KC
+5: KC
+6: NK
+7: KC
+8: ILCs
+9: ILCs
+10: FB
+11: SMC+EC
+12: ILCs
+13: B
+14: ILCs
+15: PH
+16: ILCs
+
+Since T cells (T) and Melanocytes (MEL) were not found, we plot more canonical markers to check the annotation and also add cell type label on genes.
+
+```{r}
+# Using ggh4x and dot plot to visulize canonical markers
+
+# install.packages("ggh4x")
+# library(ggh4x)
+
+gene_celltype_df <- data.frame(
+  gene = c(
+    # ILCs
+    "PTPRC", "KLRB1", "IL7R",
+    # NK cells
+    "KLRD1", "NKG7", "GNLY", "GZMB",
+    # T cells
+    "CD3D", "CD4", "CD8A", "TRAC", "TRBC1",
+    # Keratinocytes
+    "KRT1", "KRT5", "KRT10",
+    # Fibroblasts
+    "COL6A1", "COL1A1", "COL1A2",
+    # B-lineage cells (b cells + plasma cells)
+    "CD79A", "IGHG1", "MZB1", "JCHAIN",
+    # Phagocytes
+    "LYZ",
+    # Endothelial cells
+    "CLEC14A", "PECAM1",
+    # Smooth muscle cells
+    "TAGLN", "ACTA2",
+    # Melanocytes
+    "MLANA",
+    # Dendritic cells
+    "CD1A", "CD209",
+    # Mast cells
+    "TPSAB1", "CPA3"
+  ),
+  
+  cell_type = c(
+    rep("ILCs", 3),
+    rep("NK", 4),
+    rep("T", 5),
+    rep("KC", 3),
+    rep("FB", 3),
+    rep("B", 4),
+    rep("PH", 1),
+    rep("EC", 2),
+    rep("SMC", 2),
+    rep("MEL", 1),
+    rep("DC", 2),
+    rep("MC", 2)
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+marker_genes <- gene_celltype_df$gene
+
+p <- DotPlot(harmonized_seurat, features = marker_genes) + 
+  scale_color_gradient2(low = "blue", mid = "lightgrey", high = "red") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p$data <- p$data %>%
+  left_join(gene_celltype_df, by = c("features.plot" = "gene"))
+
+p <- p +
+scale_x_discrete(position = "top") +  # move x axis to the top, making it like the title of each features
+facet_nested(~cell_type + features.plot, scales = "free_x", space = "free_x") +
+guides(x = guide_axis_nested(check.overlap = TRUE)) +
+theme(
+  axis.text.x = element_text(angle = 45, hjust = 0),
+  strip.text.x = element_text(size = 12, face = "bold"),
+  panel.spacing.x = unit(0.2, "lines")
+)
+
+ggsave(filename = "annotation.png", plot = p, width = 15, height = 8, dpi = 300)
+
+p
+```
+After plotting additional marker genes, we still did not identify a distinct T cell cluster. A likely explanation is that the authors sorted for CD45⁺ Lin⁻ CD3⁻ cells, thereby excluding CD3-expressing T cells during the sorting step. Regarding melanocytes, the cluster identified by the authors was small and may have been removed during doublet filtering or other processing steps.
+
+Interestingly, we observed that cells in certain NK clusters (cluster 1) and ILC clusters (clusters 0 and 16) express TRBC1 without sufficient expression of other T cell markers, as shown in the feature plots below. From the feature plots, the NK and the ILCs clusters are correlated to their marker expression, however the subset of ILCs cannot be directly distinguished by the conventional marker.
+
+
+```{r}
+# T cell markers (TRBC1 should be T cell markers but we observe ILCs and NK express it)
+FeaturePlot(harmonized_seurat, features = c("CD3D", "CD3E", "CD3G", "TRBC1"))
+FeaturePlot(harmonized_seurat, features = c("CD3D", "CD3E", "CD3G", "TRAC"))
+
+# ILCs and NK markers
+FeaturePlot(harmonized_seurat, features = c("IL7R", "KLRB1", "GNLY", "NKG7", "KLRD1"))
+
+# ILC1
+FeaturePlot(harmonized_seurat, features = c("IL7R", "KLRB1", "TBX21"), label = TRUE)
+# ILC2
+FeaturePlot(harmonized_seurat, features = c("IL7R", "KLRB1", "GATA3", "RORA"), label = TRUE)
+# ILC3
+FeaturePlot(harmonized_seurat, features = c("IL7R", "KLRB1", "RORC", "AHR"), label = TRUE)
+
+
+```
+
+```{r}
+# Visualize the annotation with umap
+
+cluster_ids <- levels(harmonized_seurat$SCT_snn_res.0.6)
+new_cluster_names <- c(
+  "ILCs", "NK", "KC", "UK", "KC", 
+  "KC", "NK", "KC", "ILCs+NK", "ILCs",
+  "FB", "EC+SMC", "ILCs", "B", "UK", "PH", "ILCs"
+)
+
+names(new_cluster_names) <- cluster_ids
+
+harmonized_seurat$celltype.paper <- plyr::mapvalues(
+  x = harmonized_seurat$SCT_snn_res.0.6,
+  from = cluster_ids,
+  to = new_cluster_names
+)
+
+table(harmonized_seurat$celltype.paper)
+
+Idents(harmonized_seurat) <- harmonized_seurat$celltype.paper
+
+p3 <- DimPlot(harmonized_seurat, reduction = "umap", label = TRUE) +
+  ggtitle("Annotation by canonical markers") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 + p3
+```
+```{r}
+saveRDS(harmonized_seurat, file = "/Users/yunchichen/113-2_scRNA/final_project/processed_data/canonical_annotated_seurat.rds")
+```
+
+
+
+## Compare the marker genes to those in the paper
+
+```{r}
+# Create function to get conserved markers for any given cluster
+get_conserved <- function(seurat_object, cluster){
+  FindConservedMarkers(seurat_object,
+                       ident.1 = cluster,
+                       grouping.var = "celltype.paper",  # Use the celltype.paper for grouping
+                       only.pos = TRUE) %>%
+    rownames_to_column(var = "gene") %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+               by = c("gene" = "gene_name")) %>%
+    cbind(cluster_id = cluster, .)
+}
+
+# Iterate function across desired clusters
+conserved_markers <- map_dfr(0:16, function(cluster) {
+  get_conserved(harmonized_seurat, cluster = cluster)
+})
+
+# View the conserved markers
+View(conserved_markers)
+
+```
+
+The conserved markers were manually compared to the DEGs reported in the paper (Fig. 3G). In the ILC clusters (clusters 0, 9, 12, and 16), we identified similar DEGs to those described in the paper, including CD52, IL32, FXYD5, IL7R, and KLRB1. For NK cells (clusters 1 and 6), we found comparable DEGs such as NKG7, GNLY, GZMA, CCL4, CCL5, CST7, TYROBP, KLRD1, and CTSW.
+
+
+# Communication pathways by CellChat
+This part of the code explores several functions of CellChat. However, comparison with the published results was only performed in the section titled 'Visualize chord plot to understand the interaction among cell types for a specific pathway'.
+
+## Compute and visualize the aggregated cell-cell communication network
+```{r}
+# install.packages("BiocManager")
+# BiocManager::install("BiocNeighbors")
+# devtools::install_github("sqjin/Cellchat")
+library(CellChat)
+library(Seurat)
+library(reticulate)
+library(patchwork)
+library(circlize)
+options(stringsAsFactors = FALSE)
+```
+
+```{r}
+# Create CellChat object
+data.input <- GetAssayData(harmonized_seurat, assay = "RNA", slot = "data")
+labels <- Idents(harmonized_seurat)
+meta <- data.frame(group = labels, row.names = names(labels))
+cellchat <- createCellChat(object = data.input, meta = meta, group.by = "group")
+saveRDS(cellchat, file = "/Users/yunchichen/113-2_scRNA/final_project/processed_data/cellchat_seurat.rds")
+```
+
+```{r}
+# Load ligand-receptor interaction database
+CellChatDB.human <- CellChatDB.human
+
+# Decide which category of data to use
+showDatabaseCategory(CellChatDB.human)
+CellChatDB.use <- subsetDB(CellChatDB.human, search = "Secreted Signaling")
+cellchat@DB <- CellChatDB.use
+
+# Subset the object, making cellchat@data.signaling from <0 x 0 matrix> to 744 x 17812 sparse Matrix of class "dgCMatrix", which means there are 744 genes from CellChatDB.use database that are expressed in our cellchat object
+cellchat <- subsetData(cellchat) 
+```
+```{r}
+# Pre-processing the expression data
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+
+# Optional: project gene expression data onto protein-protein interaction (PPI)
+cellchat <- projectData(cellchat, PPI.human)
+
+# Compute the communication probability and infer cellular communication network
+# cellchat <- computeCommunProb(cellchat)
+cellchat <- computeCommunProb(cellchat, raw.use = FALSE) # use the projected data
+
+# Filter out the cell-cell communication if there are only few number of cells in certain cell groups
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+
+```
+
+```{r}
+# Infer the cell-cell communication at a signaling pathway level
+cellchat <- computeCommunProbPathway(cellchat)
+
+# Calculate the aggregated cell-cell communication network
+cellchat <- aggregateNet(cellchat)
+cellchat@net$count
+cellchat@net$weight
+```
+
+```{r}
+# Visualize the aggregated cell-cell communication network
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1, 2), xpd=TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, 
+   weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, 
+   weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+
+dev.off()
+```
+
+```{r}
+# Examine the signaling sent from each cell group
+mat <- cellchat@net$weight
+par(mfrow = c(2, 6), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = F, 
+                   edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+
+dev.off()
+
+mat <- cellchat@net$weight
+par(mfrow = c(1, 2), xpd=TRUE)
+for (i in 1:nrow(mat)) {  
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))  
+  mat2[i, ] <- mat[i, ]  
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, 
+                   edge.weight.max = max(mat), title.name = rownames(mat)[i])}
+```
+
+## Compute and visualize the network centrality scores for specific pathway
+```{r, fig.wide = TRUE, fig.align = "center"}
+# Compute the network centrality scores
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP") # the slot 'netP' means the inferred intercellular communication network of signaling pathways
+
+# Visualize the computed centrality scores using heatmap, allowing ready identification of major signaling roles of cell groups
+pathways.show <- c("IL4") # IL-4 is one of the significant pathway identified in the paper
+netAnalysis_signalingRole_network(cellchat, signaling = pathways.show, width = 8, height = 2.5, font.size = 10)
+```
+## Visualize chord plot to understand the interation among cell types for specific pathway
+```{r}
+# These 6 pathways are mentioned by the paper, which are communication pathways between ILCs and other cell types
+netVisual_chord_cell(cellchat, signaling = c("IL2"))
+netVisual_chord_cell(cellchat, signaling = c("IL4"))
+netVisual_chord_cell(cellchat, signaling = c("CCL"))
+netVisual_chord_cell(cellchat, signaling = c("CXCL"))
+netVisual_chord_cell(cellchat, signaling = c("MIF"))
+netVisual_chord_cell(cellchat, signaling = c("BAG"))
+```
+We identify similar ligand-receptor communication among cell types as the paper (Fig. 3I). ILCs exhibit strong ligand-receptor interactions with other cell types, particularly in the IL-4 and CXCL signaling pathways. NK cells also engage in robust ligand-receptor interactions, especially through the CCL signaling pathways.
+
+
+
+# Re-cluster ILCs and NK to characterize the molecular heterogeneity of them
+The rationale for re-clustering ILCs and NKs together is that they derive from a common lymphoid progenitor (CLP). By re-clustering them, we can identify ILC subtypes including NK, ILC1, ILC2, ILC3, and even some progenitors/rare cells.
+
+## Use harmony embeddings to cluster (using SCTransform to norm, findvarfeature, and scale again on subset)
+```{r}
+# Check the idents
+levels(Idents(harmonized_seurat))
+
+# Subset the targeted cells
+subset_cells <- subset(harmonized_seurat, idents = c("NK", "ILCs", "ILCs+NK"))
+
+# Re-run SCTransform (NormalizeData, FindVariableFeatures, ScaleData workflow) to ensure that the gene variation is calculated on the subset
+subset_cells <- SCTransform(subset_cells, vars.to.regress = "percent.mt", verbose = FALSE)
+
+# RunPCA
+subset_cells <- RunPCA(subset_cells, assay = "SCT", npcs = 50)
+
+# Elbow Plot to visualize the optimal number of PCs
+ElbowPlot(subset_cells)
+
+# Find Neighbors
+subset_cells <- FindNeighbors(subset_cells, dims = 1:20)  # Using the first 20 PCs
+
+# Find Clusters 
+subset_cells <- FindClusters(subset_cells, resolution = 0.5)  
+
+# Run UMAP for dimensionality reduction
+subset_cells <- RunUMAP(subset_cells, dims = 1:20)  # You can adjust the number of dimensions if necessary
+
+# Visualize UMAP
+p1 <- DimPlot(subset_cells, reduction = "umap", label = TRUE, group.by = "Sample")
+p2 <- DimPlot(subset_cells, reduction = "umap", label = TRUE, group.by = "Condition")
+
+p1 + p2
+
+```
+```{r}
+# Since batch effect is observed in the subset, we run Harmony on the subset.
+
+library(harmony)
+
+subset_cells <- RunHarmony(subset_cells,
+                            group.by.vars = c("Sample", "Condition"),
+                            reduction = "pca",
+                            assay.use = "SCT",
+                            reduction.save = "harmony")
+reduction_name <- "harmony"
+
+# Visualize UMAP
+p3 <- DimPlot(subset_cells, reduction = "harmony", label = TRUE, group.by = "Sample")
+p4 <- DimPlot(subset_cells, reduction = "harmony", label = TRUE, group.by = "Condition")
+
+p3 + p4
+```
+```{r}
+# Do the dimensional reduction on harmony embedding
+subset_cells <- subset_cells %>%
+  RunUMAP(reduction = reduction_name, dims = 1:20) %>%
+  FindNeighbors(reduction = reduction_name, dims = 1:20) %>%
+  FindClusters(resolution = 0.1, algorithm = 4)  # Try on Leiden clustering (4) instead of Louvain (1), but results are similar
+
+DimPlot(subset_cells, reduction = "umap", group.by = "seurat_clusters", label = TRUE) +
+  ggtitle("UMAP of Re-clustered Subset, resolution 0.1") 
+```
+```{r}
+# ElbowPlot(subset_cells)
+```
+
+
+```{r}
+# Using ggh4x and dot plot to visulize canonical markers
+
+# install.packages("ggh4x")
+# library(ggh4x)
+
+gene_celltype_df <- data.frame(
+  gene = c(
+    # NK
+    "KLRD1", "NKG7",
+    # ILC
+    "IL7R", "KLRB1",
+    # ILC1
+    "TBX21",
+    # ILC2
+    "GATA3", "RORA",
+    # ILC3
+    "AHR", "RORC"
+  ),
+  
+  cell_type = c(
+    rep("NK", 2),
+    rep("ILC", 2),
+    rep("ILC1", 1),
+    rep("ILC2", 2),
+    rep("ILC3", 2)
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+marker_genes <- gene_celltype_df$gene
+
+p <- DotPlot(subset_cells, features = marker_genes) + 
+  scale_color_gradient2(low = "blue", mid = "lightgrey", high = "red") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p$data <- p$data %>%
+  left_join(gene_celltype_df, by = c("features.plot" = "gene"))
+
+p <- p +
+scale_x_discrete(position = "top") +  # move x axis to the top, making it like the title of each features
+facet_nested(~cell_type + features.plot, scales = "free_x", space = "free_x") +
+guides(x = guide_axis_nested(check.overlap = TRUE)) +
+theme(
+  axis.text.x = element_text(angle = 45, hjust = 0),
+  strip.text.x = element_text(size = 12, face = "bold"),
+  panel.spacing.x = unit(0.2, "lines")
+)
+
+ggsave(filename = "NK_ILC_annotation2.png", plot = p, width = 15, height = 8, dpi = 300)
+
+p
+```
+Since the canonical marker visualization did not clearly distinguish ILC subtypes, we followed the paper's approach and used SingleR for annotation.
+
+## Annotate the re-clustered NK/ILCs by SingleR
+```{r}
+# BiocManager::install("SingleR")
+# install.packages("dplyr")
+# install.packages("tidyr")
+
+# Load the libraries
+library(SingleR)
+library(SummarizedExperiment)
+library(Matrix)
+library(tidyverse)
+library(data.table)
+```
+
+```{r}
+# Part 1. Process the raw reference files (provided by the paper)
+data_dir <- "/Users/yunchichen/113-2_scRNA/final_project/GSE70580_RAW/"
+
+# List all files
+files <- list.files(data_dir, full.names = TRUE, pattern = "*.txt.gz")
+
+# Function to get labels from file name
+get_label_from_filename <- function(filename) {
+  parts <- strsplit(gsub(".txt.gz", "", basename(filename)), "_")[[1]]
+  label <- parts[length(parts) - 1]
+  return(label)
+}
+
+# Initialize
+expr_list <- list()
+labels <- c()
+sample_names <- c()
+
+for (f in files) {
+  label <- get_label_from_filename(f)
+  if (!is.na(label)) {
+    # Read file, assuming it's tab-delimited with header
+    df <- fread(f, header = TRUE)
+    
+    # Extract relevant columns
+    gene_names <- df[[1]]          # "#Gene symbol"
+    expr_values <- df[["RPKM"]]    # Use RPKM column as expression
+    
+    # Name the vector using gene symbols
+    names(expr_values) <- gene_names
+
+    # Store
+    expr_list[[f]] <- expr_values
+    labels <- c(labels, label)
+    sample_names <- c(sample_names, basename(f))  # for colnames later
+  }
+}
+
+# Part 2. Build the Expression Matrix
+# Use common genes across all samples
+common_genes <- Reduce(intersect, lapply(expr_list, names))
+
+# Build expression matrix
+expr_mat <- do.call(cbind, lapply(expr_list, function(x) x[common_genes]))
+rownames(expr_mat) <- common_genes
+colnames(expr_mat) <- sample_names
+
+# Part 3. Create SingleR reference object
+library(SummarizedExperiment)
+
+log_expr_mat <- log2(expr_mat + 1) #SingleR expects log-normalized expression
+
+ref_se <- SummarizedExperiment(
+  assays = list(logcounts = log_expr_mat)
+)
+
+colData(ref_se)$label <- labels
+```
+
+```{r}
+# SingleR expects log-normalized counts, not corrected residuals from SCTransform
+DefaultAssay(subset_cells) <- "RNA"
+subset_cells <- NormalizeData(subset_cells)
+
+# Extract expression matrix for annotation
+test_expr <- GetAssayData(subset_cells, assay = "RNA", slot = "data") # gene (rows) × cells (columns) matrix
+
+# Run SingleR
+singleR_results <- SingleR(
+  test = as.matrix(test_expr),  # cell-level matrix
+  ref = ref_se,                 # bulk reference
+  labels = ref_se$label         # vector of labels (e.g., ILC1, ILC2, ILC3, NK)
+)
+
+# Add SingleR labels back to Seurat metadata
+subset_cells$SingleR_label <- singleR_results$labels
+
+# Visualize results
+DimPlot(subset_cells, group.by = "SingleR_label", label = TRUE) +
+  ggtitle("SingleR Annotation")
+```
+
+
+```{r}
+# Also check the pruned result, which the unsure predictions are shown in grey
+subset_cells$SingleR_pruned <- singleR_results$pruned.labels
+DimPlot(subset_cells, group.by = "SingleR_pruned", label = TRUE)
+```
+From the results, NK cells and ILC2s can be easily distinguished, which is consistent with the findings reported in the paper. We also observed that ILC1s are scattered across different clusters, which similarly aligns with the paper’s observations. Another similarity is that only a small proportion of ILC3s were identified. In summary, ILC2s and NK cells appear to be the predominant innate lymphoid cell populations in human skin.
+
+
+# Identify DEGs across conditions in ILCs and NK, and conduct their functional enrichment analysis
+```{r}
+# Check default assay and idents
+DefaultAssay(harmonized_seurat)
+DefaultAssay(harmonized_seurat) <- "SCT"
+table(Idents(harmonized_seurat))
+```
+
+```{r}
+# Perform differential expression for ILCs
+ad <- PrepSCTFindMarkers(harmonized_seurat)
+ad$celltype.stim <- paste(ad$celltype.paper, ad$Condition, sep = "_")
+Idents(ad) <- "celltype.stim"
+ilc.ad.response <- FindMarkers(ad, ident.1 = "ILCs_AD", ident.2 = "ILCs_NHS", verbose = FALSE)
+
+# Filter genes with p_val_adj < 0.05 & pct.1 > 0.2
+significant_genes <- ilc.ad.response[ilc.ad.response$p_val_adj < 0.05 & ilc.ad.response$pct.1 > 0.2,]
+
+# Rank by avg_log2FC (absolute value for both upregulated and downregulated genes)
+ranked_genes <- significant_genes[order(significant_genes$avg_log2FC, decreasing = TRUE), ]
+
+# View the top upregulated genes
+head(ranked_genes, 20)  # Top 20 upregulated genes
+```
+
+
+```{r}
+# Perform differential expression for NK
+nk.ad.response <- FindMarkers(ad, ident.1 = "NK_AD", ident.2 = "NK_NHS", verbose = FALSE)
+
+# Filter genes with p_val_adj < 0.05 & pct.1 > 0.2
+significant_genes2 <- nk.ad.response[nk.ad.response$p_val_adj < 0.05 & nk.ad.response$pct.1 > 0.2,]
+
+# Rank by avg_log2FC (absolute value for both upregulated and downregulated genes)
+ranked_genes2 <- significant_genes2[order(significant_genes2$avg_log2FC, decreasing = TRUE), ]
+
+# View the top upregulated genes
+head(ranked_genes2, 20)  # Top 20 upregulated genes
+```
+
+The top 20 unregulated genes were input to [Enrichr](https://maayanlab.cloud/Enrichr/) to do functional enrichment analysis using Reactome and KEGG database. In atopic dermatitis (AD), ILCs exhibited upregulated immune-related pathways, with DEGs such as IL22 and IL26 (associated with ILC3), and AREG (associated with ILC2). In addition, NK cells in AD showed upregulation of TNF signaling and antimicrobial response pathways.
+
+
+
+# Identify DEGs across conditions in ILC1, ILC2, ILC3 and NK, and conduct their functional enrichment analysis
+```{r}
+# Check default assay and idents
+DefaultAssay(subset_cells)
+DefaultAssay(subset_cells) <- "SCT"
+table(Idents(subset_cells))
+Idents(subset_cells) <- subset_cells$SingleR_pruned
+table(Idents(subset_cells))
+```
+
+```{r}
+# Perform differential expression
+ad.ilc <- PrepSCTFindMarkers(subset_cells)
+ad.ilc$celltype.stim <- paste(ad.ilc$SingleR_pruned, ad.ilc$Condition, sep = "_")
+Idents(ad.ilc) <- "celltype.stim"
+
+# ILC1-----------------------------------
+ad.ilc1.response <- FindMarkers(ad.ilc, ident.1 = "ILC1_AD", ident.2 = "ILC1_NHS", verbose = FALSE)
+
+# Filter genes with p_val_adj < 0.05 & pct.1 > 0.2
+significant_genes1 <- ad.ilc1.response[ad.ilc1.response$p_val_adj < 0.05 & ad.ilc1.response$pct.1 > 0.2,]
+
+# Rank by avg_log2FC (absolute value for both upregulated and downregulated genes)
+ranked_genes1 <- significant_genes1[order(significant_genes1$avg_log2FC, decreasing = TRUE), ]
+
+# View the top upregulated genes
+head(ranked_genes1, 20)  # Top 20 upregulated genes
+
+
+# ILC2-----------------------------------
+ad.ilc2.response <- FindMarkers(ad.ilc, ident.1 = "ILC2_AD", ident.2 = "ILC2_NHS", verbose = FALSE)
+
+# Filter genes with p_val_adj < 0.05 & pct.1 > 0.2
+significant_genes2 <- ad.ilc2.response[ad.ilc2.response$p_val_adj < 0.05 & ad.ilc2.response$pct.1 > 0.2,]
+
+# Rank by avg_log2FC (absolute value for both upregulated and downregulated genes)
+ranked_genes2 <- significant_genes2[order(significant_genes2$avg_log2FC, decreasing = TRUE), ]
+
+# View the top upregulated genes
+head(ranked_genes2, 20)  # Top 20 upregulated genes
+
+
+# ILC3-----------------------------------
+ad.ilc3.response <- FindMarkers(ad.ilc, ident.1 = "ILC3_AD", ident.2 = "ILC3_NHS", verbose = FALSE)
+
+# Filter genes with p_val_adj < 0.05 & pct.1 > 0.2
+significant_genes3 <- ad.ilc3.response[ad.ilc3.response$p_val_adj < 0.05 & ad.ilc3.response$pct.1 > 0.2,]
+
+# Rank by avg_log2FC (absolute value for both upregulated and downregulated genes)
+ranked_genes3 <- significant_genes3[order(significant_genes3$avg_log2FC, decreasing = TRUE), ]
+
+# View the top upregulated genes
+head(ranked_genes3, 20)  # Top 20 upregulated genes
+
+
+# NK-----------------------------------
+ad.nk.response <- FindMarkers(ad.ilc, ident.1 = "NK_AD", ident.2 = "NK_NHS", verbose = FALSE)
+
+# Filter genes with p_val_adj < 0.05 & pct.1 > 0.2
+significant_genes4 <- ad.nk.response[ad.nk.response$p_val_adj < 0.05 & ad.nk.response$pct.1 > 0.2,]
+
+# Rank by avg_log2FC (absolute value for both upregulated and downregulated genes)
+ranked_genes4 <- significant_genes4[order(significant_genes4$avg_log2FC, decreasing = TRUE), ]
+
+# View the top upregulated genes
+head(ranked_genes4, 20)  # Top 20 upregulated genes
+```
+
+The top 20 unregulated genes were input to [Enrichr](https://maayanlab.cloud/Enrichr/) to do functional enrichment analysis using Reactome and KEGG database. Due to the limited number of ILC3 cells, no significant DEGs could be identified based on the adjusted p-value (p_val_adj). For NK cells, ILC1, and ILC2, the Reactome analysis revealed enrichment in the 'Metal Sequestration by Antimicrobial Proteins' pathway, while the KEGG analysis identified enrichment in the 'IL-17 signaling pathway'.
